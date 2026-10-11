@@ -72,17 +72,27 @@ def main():
 
     inside = 0
     for b in [i for i in doc["instances"] if i["group"] == "Buildings"]:
-        walls, _ = read_obj(os.path.join(scene, f"buildings/{b['name']}_walls.obj"))
-        corners = np.unique(walls[:, :2].round(3), axis=0)
-        c = np.array(b["centre"])
-        far = corners[np.argsort(-np.hypot(*(corners - c).T))[:4]]
-        u = next((q - far[0]) / np.hypot(*(q - far[0])) for q in far[1:] if abs(np.hypot(*(q - far[0])) - b["length"]) < 0.05)
-        w = np.array([-u[1], u[0]])
+        c, u = np.array(b["centre"]), np.array(b["axis"])
         p = np.array([t["pos"][:2] for t in trees]) - c
-        inside += int(((np.abs(p @ u) < b["length"] / 2) & (np.abs(p @ w) < b["width"] / 2)).sum())
+        along, across = p @ u, p @ np.array([-u[1], u[0]])
+        for u0, u1, low, high in b["plan"]:
+            inside += int(((along > u0) & (along < u1) & (across > low) & (across < high)).sum())
     print(f"{inside} trunks inside a building")
     if inside:
         failed.append("trees inside buildings")
+
+    # Nor in a tank or a yard of plant: each small structure says what ground it covers.
+    trunks = np.array([t["pos"][:2] for t in trees])
+    within = 0
+    for item in [i for i in doc["instances"] if i["group"] == "Props" and "outline" in i]:
+        ring = np.array(item["outline"])
+        ahead = np.roll(ring, -1, axis=0) - ring
+        # An outline is a convex ring, anticlockwise: a point inside is to the left of every edge.
+        left = ahead[None, :, 0] * (trunks[:, None, 1] - ring[None, :, 1]) - ahead[None, :, 1] * (trunks[:, None, 0] - ring[None, :, 0])
+        within += int(((left > 0).all(1) | (left < 0).all(1)).sum())
+    print(f"{within} trunks inside a small structure")
+    if within:
+        failed.append("trees inside small structures")
 
     cones = [i for i in doc["instances"] if i["group"] == "Cones"]
     off = sum(distance_to_road(np.array(c["pos"][:2])) > 0.3 for c in cones)
@@ -164,6 +174,60 @@ def main():
     print(f"ground: {len(gf)} triangles, {once} edges used once ({rim} on the outer rim), {many} used more than twice")
     if once != rim or many:
         failed.append("ground mesh is not watertight")
+
+    piles = placed("Rocks")
+    if piles:
+        # A boulder may stand on the fringe of an apron. None stands out in the pavement, with
+        # road three metres off on every side of it.
+        far = [3.0 * np.array([np.cos(t), np.sin(t)]) for t in np.arange(8) * np.pi / 4]
+        on_road = sum(all(distance_to_road(np.array(p["at"]) + r) == 0 for r in [np.zeros(2)] + far) for p in piles)
+        print(f"{len(piles)} rock piles and boulders, {sum(p['stones'] for p in piles)} stones: {on_road} out in the road")
+        if on_road:
+            failed.append("rocks on the road")
+
+    # Every parked vehicle stands on its wheels: under each of the four, the tyre's lowest
+    # point is on the ground mesh, not in the air above it and not sunk into it.
+    if cars:
+        corners = gv[gf]
+        middles = corners[:, :, :2].mean(1)
+        span = np.hypot(*(corners[:, :, :2] - middles[:, None, :]).transpose(2, 0, 1)).max(1)
+        near_cars = np.zeros(len(gf), bool)
+        for car in cars:
+            near_cars |= np.hypot(*(middles - np.array(car["pos"][:2])).T) < 6.0 + span
+        local = np.nonzero(near_cars)[0]
+        tree = cKDTree(middles[local])
+
+        def ground_under(p):
+            for j in tree.query_ball_point(p[:2], float(span[local].max()) + 1e-6):
+                a, b, c = corners[local[j]]
+                det = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1])
+                if abs(det) < 1e-12:
+                    continue
+                u = ((b[1] - c[1]) * (p[0] - c[0]) + (c[0] - b[0]) * (p[1] - c[1])) / det
+                v = ((c[1] - a[1]) * (p[0] - c[0]) + (a[0] - c[0]) * (p[1] - c[1])) / det
+                if u >= -1e-9 and v >= -1e-9 and u + v <= 1 + 1e-9:
+                    return u * a[2] + v * b[2] + (1 - u - v) * c[2]
+            return None
+
+        gaps = []
+        for car in cars:
+            part = next(p for p in doc["assets"][car["asset"]]["parts"] if p["name"] == "tyres")
+            v, _ = read_obj(os.path.join(scene, part["mesh"]))
+            w, x, y, z = car["rot"]
+            turn = np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+                             [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+                             [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]])
+            placed_at = (v * np.array(car["scale"])) @ turn.T + np.array(car["pos"])
+            for front in (True, False):
+                for left in (True, False):
+                    wheel = placed_at[((v[:, 0] > 0) == front) & ((v[:, 1] > 0) == left)]
+                    lowest = wheel[np.argmin(wheel[:, 2])]
+                    under = ground_under(lowest)
+                    gaps.append(np.nan if under is None else lowest[2] - under)
+        gaps = np.array(gaps)
+        print(f"{len(cars)} parked vehicles: tyres {np.nanmin(gaps) * 100:+.1f} to {np.nanmax(gaps) * 100:+.1f} cm from the ground under them")
+        if not np.isfinite(gaps).all() or np.abs(gaps).max() > 0.03:
+            failed.append("a parked vehicle is not standing on its wheels")
 
     if failed:
         raise SystemExit("FAILED: " + ", ".join(failed))

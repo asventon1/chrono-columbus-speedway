@@ -22,24 +22,30 @@ import time
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import blocks  # noqa: E402
 import buildings  # noqa: E402
 import carmodels  # noqa: E402
 import cone_model  # noqa: E402
 import cones  # noqa: E402
+import footprint  # noqa: E402
 import forest  # noqa: E402
 import ground  # noqa: E402
 import groundphoto  # noqa: E402
+import landmarks  # noqa: E402
 import objects  # noqa: E402
+import paintwear  # noqa: E402
 import polemodel  # noqa: E402
+import poles  # noqa: E402
 import railmodel  # noqa: E402
 import layout  # noqa: E402
 import markmodel  # noqa: E402
 import reference  # noqa: E402
 import renderer  # noqa: E402
+import rockmodel  # noqa: E402
 import tiles  # noqa: E402
 import transform  # noqa: E402
+import structures  # noqa: E402
 import treegen  # noqa: E402
+import vehicles  # noqa: E402
 import wall_colour  # noqa: E402
 
 # The ground as one collision mesh, and the same triangles as two, for those who want the
@@ -51,6 +57,7 @@ MANIFEST = "speedway_scene.json"
 PARKED = ("sedan", "hatchback", "suv")   # the models parked cars are drawn from. Chrono's van is a 1970s microbus
 TALL_VEHICLE = 1.8    # metres: models at least this tall are the SUVs, vans and pickups
 TALL_SEEN = 1.6       # and vehicles the scan measured at least this tall get one of them
+PHOTOGRAPHED = "textures/photo"     # where a worn build keeps the ground's pictures as the drone took them
 
 
 def chrono_data(args):
@@ -70,8 +77,9 @@ def main():
     parser.add_argument("--scan", default=None, help="the scan directory, needed to read wall colours")
     parser.add_argument("--chrono-data", default=None, help="Chrono's data directory, for the cone model (default: ask the installed PyChrono)")
     parser.add_argument("--save-photo", action="store_true", help="also write the finished ground photo and the pavement map to WORK_DIR, for audit_ground.py")
-    parser.add_argument("--without", default="", help="comma-separated kinds of thing to leave alone, out of poles, vehicles, blocks, barriers, markings, edgelines")
+    parser.add_argument("--without", default="", help="comma-separated kinds of thing to leave alone, out of poles, vehicles, blocks, barriers, landmarks, rocks, markings, edgelines")
     parser.add_argument("--keep-shadows", action="store_true", help="publish the photo with its shadows still in")
+    parser.add_argument("--worn", action="store_true", help="the track as found, for testing perception: cracks, joints and stains stay in the photo, and paint is as worn as the photo shows it")
     args = parser.parse_args()
     start = time.perf_counter()
 
@@ -80,13 +88,25 @@ def main():
     t = transform.Transform(args.work)
     os.makedirs(args.scene, exist_ok=True)
 
-    filled, matched, things, masks, edge = groundphoto.prepare(args.work, ref, raster, deshadow=not args.keep_shadows, without=set(filter(None, args.without.split(","))))
+    def timed(message):
+        """What the photo's preparation reports, with the time each step was reached."""
+        print(f"[{time.perf_counter() - start:5.1f} s]{message if message.startswith(' ') else ' ' + message}", flush=True)
+
+    filled, matched, things, masks, edge = groundphoto.prepare(args.work, ref, raster, deshadow=not args.keep_shadows, without=set(filter(None, args.without.split(","))),
+                                                               log=timed, worn=args.worn)
     print(f"[{time.perf_counter() - start:5.1f} s] ground photo ready")
     if args.save_photo:
         np.save(os.path.join(args.work, "ground_photo.npy"), filled)
 
     os.makedirs(os.path.join(args.scene, "textures"), exist_ok=True)
     tiles.save_texture(matched, os.path.join(args.scene, "textures", "surround.jpg"))
+    if args.worn:
+        # The ground's pictures once more, as the drone took them. Chrono::VSG cannot show
+        # ground brighter than a ceiling, so its pictures are darkened and their highlights
+        # squeezed, and on sunlit concrete that takes from half to nine tenths of the contrast
+        # a joint or a stain has. A renderer without that ceiling is given these (sensor_scene.py).
+        tiles.write_tiles(filled, raster, "standard", os.path.join(args.scene, PHOTOGRAPHED), edge, as_photographed=True)
+        tiles.save_texture(matched, os.path.join(args.scene, PHOTOGRAPHED, "surround.jpg"), as_photographed=True)
     for level in args.levels.split(","):
         size, with_road = tiles.write_tiles(filled, raster, level, os.path.join(args.scene, "textures", level), edge)
         print(f"[{time.perf_counter() - start:5.1f} s] {level}: {len(raster['tiles'])} tiles of {layout.tile_pixels(layout.LEVELS[level])} px,"
@@ -121,26 +141,32 @@ def main():
         b = asset.pop("footprint")
         assets.append(asset)
         instances.append({"asset": len(assets) - 1, "group": "Buildings", "name": asset["name"], "pos": [0.0, 0.0, 0.0], "rot": [1.0, 0.0, 0.0, 0.0], "scale": [1.0, 1.0, 1.0],
-                          "centre": b["centre"], "length": round(2 * b["half_length"], 2), "width": round(2 * b["half_width"], 2),
-                          "eave_height": round(b["eave"], 2), "ridge_height": round(b["ridge"], 2)})
-        print(f"  {asset['name']}: {2 * b['half_length']:.1f} x {2 * b['half_width']:.1f} m, eave {b['eave']:.1f} m, ridge {b['ridge']:.1f} m,"
-              f" walls {tuple(round(c, 2) for c in walls[len(instances) - len(parts) - 1])}")
+                          "centre": b["centre"], "axis": b["axis"], "length": round(2 * b["half_length"], 2), "width": round(2 * b["half_width"], 2),
+                          "plan": b["plan"], "eave_height": round(b["eave"], 2), "ridge_height": round(b["ridge"], 2)})
 
     # Trees: generated models planted where the scan measured crowns.
     measured = json.load(open(os.path.join(args.work, "trees.json")))
     k = int(round(cell / raster["res"]))
     h, w = obj["height"].shape
     small = np.stack([np.asarray(raw[..., ch], dtype=np.float32)[:h * k, :w * k].reshape(h, k, w, k).mean((1, 3)) for ch in range(3)], -1)
-    # A building is drawn as the rectangle fitted to it, which covers more ground than its roof
-    # did where the real plan is an L. Trees keep out of the rectangle, with a metre to spare.
+    # Trees keep a metre clear of every building's plan as it is drawn.
     footprints = obj["buildings"].copy()
+    not_trees = obj["buildings"].copy()
     for b in found:
         u = np.array(b["axis"])
         along = (gx - b["centre"][0]) * u[0] + (gy - b["centre"][1]) * u[1]
         across = -(gx - b["centre"][0]) * u[1] + (gy - b["centre"][1]) * u[0]
-        footprints |= (np.abs(along) < b["half_length"] + 1.0) & (np.abs(across) < b["half_width"] + 1.0)
+        footprints |= footprint.covers(b["plan"], along, across, margin=1.0)
+        not_trees |= footprint.covers(b["plan"], along, across)
+    # The survey takes anything tall that is not a roof for a tree, and a tank or a yard of
+    # plant is both. A tree it found in one of those, or under a roof's edge, is the thing
+    # itself and is left out. And no tree is moved into one.
+    if "blocks" not in args.without.split(","):
+        grid = (float(obj["x0"]), float(obj["y1"]), cell, footprints.shape)
+        not_trees |= structures.cover(things["blocks"], *grid, margin=1.0, whole=True)
+        footprints |= not_trees
     library, placements = forest.plan(measured, obj["crowns"], obj["height"], small, objects.water(ref, gx, gy), masks["paved"], footprints,
-                                      (float(obj["x0"]), float(obj["y1"]), cell), ref)
+                                      (float(obj["x0"]), float(obj["y1"]), cell), ref, not_trees=not_trees, log=print)
     os.makedirs(os.path.join(args.scene, "trees"), exist_ok=True)
     used = {p["model"] for p in placements}
     index, budget = {}, {}
@@ -184,6 +210,12 @@ def main():
     print(f"[{time.perf_counter() - start:5.1f} s] {len(things['poles'])} light poles in {len(by_height)} heights:"
           f" {', '.join(f'{h:g}' for h in sorted(by_height))} m")
 
+    # The pavement's own triangles, for whatever has to lie or stand exactly on them.
+    road = markmodel.Road(g.vertices, g.road)
+
+    def ground_height(xs, ys):
+        return road.height(xs, ys, ground.surface(ref, xs, ys))
+
     # Parked vehicles: models made from the meshes Chrono ships, in the colour the drone saw.
     if things["vehicles"]:
         models = [m for m in carmodels.build(chrono_data(args), os.path.join(args.scene, "vehicles")) if m["name"] in PARKED]
@@ -207,24 +239,22 @@ def main():
                      "roughness_value": p.get("roughness", 0.5), "metallic_value": p.get("metallic", 0.0)} for p in model["parts"]]})
             paint = {p["name"]: [round(v, 3) for v in renderer.colour_for_renderer(car["colour"])] for p in model["parts"] if p.get("paint")}
             size = round(float(np.clip(car["height"] / model["height"], 0.85, 1.05)), 3)
+            # Stood on its four wheels: tilted to the ground under them, not level in the air.
+            pos, rot = vehicles.seat(car["x"], car["y"], car["yaw"], model["wheel_centres"], size, ground_height)
             instances.append({"asset": placed[model["name"]], "group": "Vehicles", "name": f"vehicle_{n:02d}", "model": model["name"],
-                              "pos": [round(car["x"], 2), round(car["y"], 2), round(float(ref.elevation(car["x"], car["y"])), 3)],
-                              "rot": [round(float(np.cos(car["yaw"] / 2)), 5), 0.0, 0.0, round(float(np.sin(car["yaw"] / 2)), 5)],
+                              "pos": [round(pos[0], 2), round(pos[1], 2), round(pos[2], 3)], "rot": [round(v, 5) for v in rot],
                               "scale": [size, size, size], "colours": paint})
         print(f"[{time.perf_counter() - start:5.1f} s] {len(things['vehicles'])} parked vehicles: " + ", ".join(i["model"] for i in instances if i["group"] == "Vehicles"))
 
-    # Small structures, each a block of the size and colour the scan gives it.
-    if things["blocks"]:
-        os.makedirs(os.path.join(args.scene, "props"), exist_ok=True)
-        blocks.write_unit(os.path.join(args.scene, "props", "block.obj"))
-        assets.append({"name": "block", "parts": [{"name": "block", "mesh": "props/block.obj", "colour": [0.8, 0.8, 0.8], "roughness_value": 0.8}]})
-        for n, b in enumerate(things["blocks"]):
-            instances.append({"asset": len(assets) - 1, "group": "Props", "name": f"block_{n:02d}",
-                              "pos": [round(b["x"], 2), round(b["y"], 2), round(float(ref.elevation(b["x"], b["y"])), 3)],
-                              "rot": [round(float(np.cos(b["yaw"] / 2)), 5), 0.0, 0.0, round(float(np.sin(b["yaw"] / 2)), 5)],
-                              "scale": [b["length"], b["width"], b["height"]],
-                              "colours": {"block": [round(v, 3) for v in renderer.colour_for_renderer(b["colour"])]}})
-        print(f"[{time.perf_counter() - start:5.1f} s] {len(things['blocks'])} small structures as blocks")
+    # Small structures. What kind of thing each is was read by hand (structures.json), and each
+    # is built as that. One nobody named is a block of the size and colour the scan gives it.
+    if "blocks" not in args.without.split(","):
+        added, placed_things = structures.build(things["blocks"], ground_height, args.scene, renderer.colour_for_renderer, print)
+        for item in placed_things:
+            item["asset"] += len(assets)
+        assets += added
+        instances += placed_things
+        print(f"[{time.perf_counter() - start:5.1f} s] {len(placed_things)} small structures")
 
     # Guard rails and fence, each built in place along the line it was found on.
     if things["barriers"]:
@@ -257,16 +287,48 @@ def main():
                               "seen_length": round(seen, 1), "pos": [0.0, 0.0, 0.0], "rot": [1.0, 0.0, 0.0, 0.0], "scale": [1.0, 1.0, 1.0]})
         print(f"[{time.perf_counter() - start:5.1f} s] barriers: {metres['guardrail']:.0f} m of guard rail, {metres['fence']:.0f} m of fence, {drawn} triangles")
 
+    # Rock piles and boulders, each a heap of stones built in place.
+    if things.get("rocks"):
+        os.makedirs(os.path.join(args.scene, "rocks"), exist_ok=True)
+        stones = drawn = 0
+        for n, rock in enumerate(things["rocks"]):
+            parts, count = rockmodel.make(rock, ground_height, n)
+            if not parts:
+                continue
+            entry = {"name": f"rocks_{n:02d}", "parts": []}
+            for shade, (v, f) in parts.items():
+                drawn += railmodel.write_obj(os.path.join(args.scene, "rocks", f"rocks_{n:02d}_{shade}.obj"), v, f)
+                colour = np.clip(np.asarray(rock["colour"], float) * rockmodel.SHADES[shade], 0.0, 1.0)
+                entry["parts"].append({"name": shade, "mesh": f"rocks/rocks_{n:02d}_{shade}.obj", "colour": [round(float(c), 3) for c in renderer.colour_for_renderer(colour)],
+                                       "roughness_value": 0.95})
+            assets.append(entry)
+            instances.append({"asset": len(assets) - 1, "group": "Rocks", "name": f"rocks_{n:02d}", "kind": rock["kind"], "stones": count,
+                              "at": [round(rock["x"], 2), round(rock["y"], 2)], "pos": [0.0, 0.0, 0.0], "rot": [1.0, 0.0, 0.0, 0.0], "scale": [1.0, 1.0, 1.0]})
+            stones += count
+        print(f"[{time.perf_counter() - start:5.1f} s] {len(things['rocks'])} rock piles and boulders: {stones} stones, {drawn} triangles")
+
+    # One-of-a-kind things measured by hand: the lattice tower and the swing gates.
+    if things.get("landmarks"):
+        added, placed_marks = landmarks.build(things["landmarks"], poles.suns(args.work), ground_height, args.scene, renderer.colour_for_renderer)
+        for item in placed_marks:
+            item["asset"] += len(assets)
+        assets += added
+        instances += placed_marks
+        print(f"[{time.perf_counter() - start:5.1f} s] landmarks: " + ", ".join(f"{i['name']} ({i['height']:g} m)" for i in placed_marks))
+
     # Road paint, as ribbons laid on the pavement.
-    road = markmodel.Road(g.vertices, g.road)
     if things["markings"]:
         os.makedirs(os.path.join(args.scene, "markings"), exist_ok=True)
         drawn = 0
-        for colour, (v, f) in markmodel.make(things["markings"], ref, road).items():
-            drawn += markmodel.write_obj(os.path.join(args.scene, "markings", f"paint_{colour}.obj"), v, f)
-            assets.append({"name": f"paint_{colour}", "parts": [{"name": "paint", "mesh": f"markings/paint_{colour}.obj", "roughness_value": 0.9,
-                                                                 "colour": [round(c, 3) for c in renderer.colour_for_renderer(markmodel.COLOURS[colour])]}]})
-            instances.append({"asset": len(assets) - 1, "group": "Markings", "name": f"paint_{colour}", "pos": [0.0, 0.0, 0.0], "rot": [1.0, 0.0, 0.0, 0.0], "scale": [1.0, 1.0, 1.0]})
+        for name, (v, f) in markmodel.make(things["markings"], ref, road).items():
+            # A name is a colour, or in a worn build a colour and how much of it is left.
+            colour, _, level = name.partition("@")
+            seen = paintwear.colour(colour, int(level), things["pavement"]) if level else markmodel.COLOURS[colour]
+            name = name.replace("@", "_")
+            drawn += markmodel.write_obj(os.path.join(args.scene, "markings", f"paint_{name}.obj"), v, f)
+            assets.append({"name": f"paint_{name}", "parts": [{"name": "paint", "mesh": f"markings/paint_{name}.obj", "roughness_value": 0.9,
+                                                               "colour": [round(c, 3) for c in renderer.colour_for_renderer(seen)]}]})
+            instances.append({"asset": len(assets) - 1, "group": "Markings", "name": f"paint_{name}", "pos": [0.0, 0.0, 0.0], "rot": [1.0, 0.0, 0.0, 0.0], "scale": [1.0, 1.0, 1.0]})
         # The strokes themselves travel with the scene: they are the lane geometry, as data.
         with open(os.path.join(args.scene, "markings", "strokes.json"), "w") as f:
             json.dump(things["markings"], f)
@@ -302,14 +364,14 @@ def main():
         print(f"[{time.perf_counter() - start:5.1f} s] {len(found_cones)} cones, {triangles} triangles each")
 
     manifest = {
-        "version": 3,
+        "version": 6,
         "name": "Columbus 151 Speedway",
         "frame": {
             "description": "x east, y north, z up, metres. z is elevation above sea level (NAVD88).",
             "utm_zone": layout.UTM_ZONE, "origin_easting": layout.ORIGIN_E, "origin_northing": layout.ORIGIN_N,
             "extent": [layout.SCENE_X0, layout.SCENE_Y0, layout.SCENE_X1, layout.SCENE_Y1],
         },
-        "labels": ["Road", "Terrain", "Buildings", "Trees", "Cones", "Poles", "Vehicles", "Barriers", "Props", "Markings", "EdgeLines"],
+        "labels": ["Road", "Terrain", "Buildings", "Trees", "Cones", "Poles", "Vehicles", "Barriers", "Props", "Rocks", "Markings", "EdgeLines"],
         "texture_levels": {k: layout.LEVELS[k] for k in args.levels.split(",")},
         "collision": COLLISION,
         "files": extra_files,
@@ -317,6 +379,9 @@ def main():
         "assets": assets,
         "instances": instances,
     }
+    if args.worn:
+        manifest["worn"] = "the track as found: cracks, joints and stains kept in the photo, paint as worn as the photo shows it"
+        manifest["as_photographed"] = PHOTOGRAPHED
     with open(os.path.join(args.scene, MANIFEST), "w") as f:
         json.dump(manifest, f, indent=1)
     print(f"[{time.perf_counter() - start:5.1f} s] wrote {MANIFEST}: {len(assets)} assets, {len(instances)} placements")

@@ -8,6 +8,7 @@ import json
 import os
 
 import numpy as np
+from PIL import Image, ImageDraw
 from scipy import ndimage
 
 import barriers
@@ -16,6 +17,7 @@ import compose
 import cones
 import edgelines
 import fill
+import landmarks
 import markings
 import markings_regular
 import markings_solid
@@ -24,16 +26,23 @@ import markings_tidy
 import markmodel
 import objects
 import outline
+import paintwear
 import pavement
 import photoprofile
 import poles
 import railmodel
 import roads
+import rocks
+import structures
+import symbols
 import thinshadows
 import vehicles
 
 
 ROUGH = 13.0       # grey levels: how much ground varies over a metre before it stops being even
+STRUCTURE_MARGIN = 0.3   # metres painted out beyond a small structure's own shape
+PAINT_REACH = 0.3        # metres from a drawn line within which what was traced is that line's paint
+WORN_NEAR = 1.0          # metres round a crown or a relit shadow that blotches are mopped up in, in a worn build
 
 
 def open_ground(work, raster, photo):
@@ -79,8 +88,13 @@ def open_ground(work, raster, photo):
             "grass": grass, "sunlit_paved": sunlit_paved, "grey": grey, "valid": valid, "smooth": smooth}
 
 
-def thin_shadows(photo, raster, g, paved, wet, grains, log):
-    """Paint out the shadows of poles and posts. photo is changed in place."""
+def thin_shadows(photo, raster, g, paved, wet, grains, log, paved_only=None):
+    """Paint out the shadows of poles and posts. photo is changed in place.
+
+    paved_only, a map on the pavement's cells, keeps the lines taken off pavement to where it
+    is set. A joint or a sealed crack in concrete is a thin dark straight line too, and
+    nothing here can tell it from a shadow.
+    """
     cell = g["cell"]
     shape = paved.shape
     open_cells = g["known"] & ~wet
@@ -89,6 +103,8 @@ def thin_shadows(photo, raster, g, paved, wet, grains, log):
     kinds = {"paved": paved & pavement.to_fine(open_cells, shape, cell) & ~rim,
              "land": ~paved & pavement.to_fine(open_cells, shape, cell) & ~rim}
     found = thinshadows.find(photo, raster, kinds["paved"], kinds["land"])
+    if paved_only is not None:
+        found["paved"] &= paved_only
     k = int(round(pavement.RES / raster["res"]))
     for name, grain in (("land", grains[0]), ("paved", grains[1])):
         full = np.zeros(photo.shape[:2], bool)
@@ -96,6 +112,16 @@ def thin_shadows(photo, raster, g, paved, wet, grains, log):
         full[:big.shape[0], :big.shape[1]] = big[:full.shape[0], :full.shape[1]]
         lines = fill.repaint_small(photo, raster, full, grain, margin=0.10)
         log(f"  thin shadows on {'pavement' if name == 'paved' else 'other ground'}: {lines} lines, {found[name].sum() * pavement.RES ** 2:.0f} m2")
+
+
+def _stand(g, cells, cell):
+    """Count some cells as ground under something standing: to be repainted, and not copied from."""
+    cells = cells & g["valid"]
+    g["standing"] |= cells
+    near = ndimage.binary_dilation(cells, iterations=int(round(0.5 / cell)))
+    for name in ("known", "grass", "sunlit_paved", "grey"):
+        g[name] &= ~near
+    g["source"] &= ~ndimage.binary_dilation(cells, iterations=int(round(2.5 / cell)))
 
 
 def paint_view(raw, matte, raster, paved):
@@ -137,13 +163,18 @@ def _paint_out(photo, raster, left, on_road, grains, taken):
     taken |= left
 
 
-def prepare(work, ref, raster, deshadow=True, without=(), log=print):
+def prepare(work, ref, raster, deshadow=True, without=(), log=print, worn=False):
     """Return (ground photo over the whole raster, aerial picture colour-matched to it, things, masks, edge).
 
     things is what was found standing on the ground and painted out, to be put back as objects:
     {"cones": [...], "poles": [...], "vehicles": [...], "blocks": [...], "barriers": [...], "markings": [...], "edge_lines": [...]}. masks is what open_ground found, with "paved" replaced by the finished pavement map, for
     the callers that plant things on that ground. edge is the pavement.Edge the mesh is cut on.
     without names kinds of thing to leave in the photo and not look for.
+
+    worn asks for the track as found, not tidied. Cracks, joints and stains stay in the photo:
+    only what is paint is painted out with the paint, and blotches are mopped up only where a
+    shadow or a crown left them. And each stroke of paint is given its wear (paintwear.py),
+    with things["pavement"] the pavement's usual colour for the worn paint to fade toward.
     """
     raw = np.load(os.path.join(work, "photo.npy"), mmap_mode="r")
     covered = np.isfinite(np.load(os.path.join(work, "surface.npy"), mmap_mode="r"))
@@ -175,7 +206,40 @@ def prepare(work, ref, raster, deshadow=True, without=(), log=print):
         return out
 
     on_road = at_full_size(paved)
-    things = {"poles": [], "vehicles": [], "blocks": [], "barriers": [], "markings": [], "edge_lines": []}
+    things = {"poles": [], "vehicles": [], "blocks": [], "barriers": [], "markings": [], "edge_lines": [], "symbols": [], "landmarks": {}, "rocks": []}
+    # Rock piles and boulders, found in the photo as flown. What they covered is ground to
+    # repaint, and they are heaped up again as stones.
+    if "rocks" not in without:
+        things["rocks"], stones = rocks.find(raw, raster, paved, obj["height"], obj["trees"], obj["buildings"], cell, log)
+        rows, cols = g["valid"].shape
+        _stand(g, stones[:rows * k_cell, :cols * k_cell].reshape(rows, k_cell, cols, k_cell).any((1, 3)), cell)
+        del stones
+        # What lies under a heap of stones is not pavement, whatever colour the heap is. A
+        # pile's own patch is taken out of the pavement map. Boulders are left: they stand
+        # one by one on an apron of dirt that the map counts as pavement, and a hole in the
+        # map for each would be eight holes in the road.
+        heaps = Image.new("L", (paved.shape[1], paved.shape[0]), 0)
+        tall = np.nan_to_num(obj["height"], nan=0.0)
+        for rock in things["rocks"]:
+            # How high the scan shows each standing: a pile is built no higher than that.
+            patch = Image.new("L", (cols, rows), 0)
+            ImageDraw.Draw(patch).polygon([((x - raster["x0"]) / cell - 0.5, (raster["y1"] - y) / cell - 0.5) for x, y in rock["outline"]], fill=1, outline=1)
+            patch = np.asarray(patch, dtype=bool)
+            rock["height"] = round(float(np.percentile(tall[patch], 90)), 2) if patch.any() else 0.0
+            if rock["kind"] == "pile":
+                ImageDraw.Draw(heaps).polygon([((x - raster["x0"]) / pavement.RES - 0.5, (raster["y1"] - y) / pavement.RES - 0.5) for x, y in rock["outline"]], fill=1)
+        heaps = ndimage.binary_dilation(np.asarray(heaps, dtype=bool), iterations=int(round(0.3 / pavement.RES))) & paved
+        if heaps.any():
+            log(f"  {heaps.sum() * pavement.RES ** 2:.0f} m2 under rock piles taken out of the pavement")
+            paved = paved & ~heaps
+            distance = ((ndimage.distance_transform_edt(paved) - ndimage.distance_transform_edt(~paved)) * pavement.RES).astype(np.float32)
+            g["paved"] = pavement.to_cells(paved, g["valid"].shape, cell)
+            on_road = at_full_size(paved)
+            np.save(os.path.join(work, "pavement.npy"), paved)
+    # One-of-a-kind things, measured by hand: what each left in the photo is ground to repaint.
+    if shadowless and "landmarks" not in without:
+        things["landmarks"] = landmarks.load()
+        _stand(g, landmarks.footprint(things["landmarks"], raster, cell, g["valid"].shape, poles.suns(work)), cell)
     taken = np.zeros(raw.shape[:2], bool)      # everything found standing, as it lies in the photo
     if shadowless:
         # The pond, as the lidar outlines it and a little beyond: its banks have moved since.
@@ -187,7 +251,11 @@ def prepare(work, ref, raster, deshadow=True, without=(), log=print):
         plain = ndimage.binary_erosion(g["paved"], iterations=int(round(0.75 / cell)))
         photo = fill.even_out(photo, raster, matte, g["known"], g["paved"] | g["grey"], wet, cell, paved, grains, before=raw, plain_cells=plain)
         log(f"  shadows relit and levelled over {(np.asarray(matte[::4, ::4]) > 64).mean() * photo.shape[0] * photo.shape[1] * raster['res'] ** 2:.0f} m2")
-        thin_shadows(photo, raster, g, paved, wet, grains, log)
+        # As found, the pavement keeps its thin dark lines: they are its joints and cracks.
+        # Every thing that casts a thin shadow and has a model is painted out with its shadow
+        # further on. The one shadow that is only taken here is the lattice tower's.
+        thin_shadows(photo, raster, g, paved, wet, grains, log,
+                     landmarks.tower_shadows(things["landmarks"], raster, pavement.RES, paved.shape) if worn else None)
         # Light poles: found in the photo as flown, by their shadows, then painted out whole.
         if "poles" not in without:
             things["poles"] = poles.locate(raw, raster, paved, obj["height"], obj["trees"], obj["buildings"], cell, work)
@@ -202,12 +270,22 @@ def prepare(work, ref, raster, deshadow=True, without=(), log=print):
         left = vehicles.footprint(things["vehicles"], raster, photo.shape[:2], raw, poles.suns(work))
         _paint_out(photo, raster, left, on_road, grains, taken)
         log(f"  painted out {len(things['vehicles'])} parked vehicles with their shadows")
-        # Tanks, huts, bleachers: small man-made things, given back as blocks.
+        # Tanks, a shed, a deck: small man-made things, given back as models of what they are.
         if "blocks" not in without:
             things["blocks"] = blocks.find(obj["height"], small_raw, obj["buildings"], things["vehicles"], cell, raster["x0"], raster["y1"])
         left = vehicles.footprint(things["blocks"], raster, photo.shape[:2], raw, poles.suns(work))
         _paint_out(photo, raster, left, on_road, grains, taken)
         log(f"  painted out {len(things['blocks'])} small structures with their shadows")
+        if "blocks" not in without:
+            # What each of them is built as covers more than its block, and some are not blocks
+            # at all: a deck, plant in a yard. What those left in the photo goes too, save
+            # under a roof, where it is the roof that is in the photo.
+            roofs = np.zeros(photo.shape[:2], bool)
+            big = np.repeat(np.repeat(obj["buildings"], k_cell, axis=0), k_cell, axis=1)
+            roofs[:big.shape[0], :big.shape[1]] = big[:roofs.shape[0], :roofs.shape[1]]
+            left = structures.cover(things["blocks"], raster["x0"], raster["y1"], raster["res"], photo.shape[:2], margin=STRUCTURE_MARGIN) & ~roofs & ~taken
+            _paint_out(photo, raster, left, on_road, grains, taken)
+            log(f"  and {left.sum() * raster['res'] ** 2:.0f} m2 more that the models of them cover")
         # Guard rails and the fence round the property.
         if "barriers" not in without:
             things["barriers"] = barriers.find(work)
@@ -291,14 +369,35 @@ def prepare(work, ref, raster, deshadow=True, without=(), log=print):
         # What is painted out is the paint as traced. What is drawn is the paint as fitted.
         traced = markmodel.footprint(found_paint, raster, painted.shape[:2]) & on_road
         fitted = markings_tidy.tidy(found_paint, log, shaded, paint_view(raw, matte, raster, paved), (where, crisp))
-        fitted = markings_stalls.regularise(fitted, lambda x, y: bool(on_road[int((raster["y1"] - y) / raster["res"]), int((x - raster["x0"]) / raster["res"])]),
-                                            markings_stalls.evidence(raw, raster, taken), log)[0]
+        def on_pavement(x, y):
+            return bool(on_road[int((raster["y1"] - y) / raster["res"]), int((x - raster["x0"]) / raster["res"])])
+
+        shows = markings_stalls.evidence(raw, raster, taken)
+        fitted = markings_stalls.regularise(fitted, on_pavement, shows, log)[0]
+        fitted = markings_stalls.hatching(fitted, on_pavement, shows, log)[0]
         fitted, put_back = markings_regular.fill(fitted, paint_can_be_at)
         log(f"  {put_back} dashes put back into runs they were missing from")
         # Double yellow lines are read from the photo afresh, and the whole width of each is
         # painted out: the trace knew of one line where there are two.
         things["markings"], bands = markings_solid.redraw(fitted, raw, raster, out_of_sight, log)
         traced |= markmodel.footprint(bands, raster, painted.shape[:2]) & on_road
+        # Accessible-parking symbols: found by their faded blue, taken out together with
+        # whatever was traced of them, and drawn whole.
+        things["symbols"], blue = symbols.find(raw, raster, distance, matte, taken, pavement.to_fine(hidden, paved.shape, cell), log)
+        for sign in things["symbols"]:
+            things["markings"] = [m for m in things["markings"] if not symbols.inside(sign, m["points"]).all()]
+        for sign in things["symbols"]:
+            things["markings"] += symbols.strokes(sign)
+        traced |= blue & on_road
+        if worn:
+            # The tracer takes a slab joint or the rim of a stain for a white line, and tidying
+            # drops it from the paint. The photo keeps it: only what lies by a line that is
+            # drawn goes. And the paint's wear is read here, while the paint is still in the photo.
+            drawn_paint = markmodel.footprint(things["markings"], raster, painted.shape[:2], margin=PAINT_REACH)
+            traced &= drawn_paint | (blue & on_road)
+            paintwear.measure(things["markings"], painted, raster, out_of_sight, log)
+            sample = np.asarray(painted[::40, ::40], dtype=np.float32)[on_road[::40, ::40] & ~taken[::40, ::40]]
+            things["pavement"] = [round(float(c) / 255.0, 4) for c in np.median(sample, axis=0)]
         fill.repaint_tiled(painted, raster, traced, grains[1])
         metres = {colour: sum(railmodel.length_of(m["points"]) for m in things["markings"] if m["colour"] == colour) for colour in ("yellow", "white")}
         log(f"  painted out {len(things['markings'])} strokes of road paint: {metres['yellow']:.0f} m yellow, {metres['white']:.0f} m white")
@@ -326,7 +425,10 @@ def prepare(work, ref, raster, deshadow=True, without=(), log=print):
     # What a crown hid has its fringe beside it: flecks of leaf and sun on the pavement
     # round a bite that has just been filled. A metre and a half round it is repainted too.
     gained = g["paved"] & ~traced
-    fringe = ndimage.binary_dilation(gained, iterations=int(round(1.5 / cell))) & g["paved"]
+    # As found, only round a bite a crown took. A road's edge redrawn a hand's width further
+    # out is gained too, all along the road, and a fringe round that is half the road's
+    # width painted over: its joints and its stains with it.
+    fringe = ndimage.binary_dilation(gained & hidden if worn else gained, iterations=int(round(1.5 / cell))) & g["paved"]
     changed = (modelled ^ traced) | gained | fringe | (modelled & ~g["paved"] & (g["standing"] | g["holes"]))
     changed = ndimage.binary_dilation(changed, iterations=1) & g["inside"]
     if changed.any():
@@ -337,7 +439,12 @@ def prepare(work, ref, raster, deshadow=True, without=(), log=print):
         soft_shade = (np.asarray(matte[::k_fine, ::k_fine]) > 32)[:paved.shape[0], :paved.shape[1]]
         wide = distance >= edgelines.APRON
         on_apron = ndimage.distance_transform_edt(~wide) * pavement.RES <= edgelines.APRON + edgelines.STOP if wide.any() else np.zeros_like(paved)
-        fill.unspot(painted, raster, paved, unseen | soft_shade | pavement.to_fine(changed, paved.shape, cell), grains[1], log, paved & ~on_apron)
+        if worn:
+            # As found, a crack or a joint stays. Only what a tree left is mopped up: on the
+            # pavement its crown hid or its shadow lay on, and a little way round that.
+            fill.unspot(painted, raster, paved, unseen | soft_shade, grains[1], log, near=WORN_NEAR)
+        else:
+            fill.unspot(painted, raster, paved, unseen | soft_shade | pavement.to_fine(changed, paved.shape, cell), grains[1], log, paved & ~on_apron)
 
     # Edge lines: not painted on the real track, drawn along every road as an option.
     if "edgelines" not in without:
