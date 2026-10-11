@@ -29,7 +29,7 @@ coasts and the wheel centres, as in a driving game.
 | `--offroad-friction MU` | friction off the pavement, which has 0.9. Default: 0.9 everywhere. See below for what it costs |
 | `--no-shadows` | do not draw shadows. Worth trying on a slow GPU |
 | `--no-sky` | plain background instead of the sky dome |
-| `--keys held\|step` | `held`, the default, follows the keys held down. `step` is Chrono's older behaviour: each press nudges an input and it stays there |
+| `--keys held\|step` | `held`, the default, follows the keys held down. It reads the keyboard through X11, so it needs an X11 desktop; anywhere else it falls back to `step`, which is Chrono's own behaviour: each press nudges an input and it stays there |
 | `--data DIR` | keep the scene somewhere else |
 | `--tire pac02\|tmeasy\|rigid` | tire model, default `pac02` |
 | `--tire-step S` | tire internal step in seconds, default `1e-4` |
@@ -86,6 +86,64 @@ z = speedway.ground_height(scene, x, y)       # ground height there
 The scene is plain files, so C++ Chrono or any other tool can read it too. `speedway_ground.obj`
 works directly with `RigidTerrain::AddPatch`, and so do `speedway_road.obj` and
 `speedway_terrain.obj` as a pair.
+
+## Record cameras for BEVFormer
+
+`record_cameras.py` drives the Audi round the track by itself and films it with six cameras on
+the roof, laid out as on the nuScenes car that BEVFormer is trained on. The cameras are
+Chrono::Sensor's ray-traced ones, so this needs an NVIDIA GPU, and ffmpeg on the path.
+
+```sh
+python record_cameras.py --out runs/lap1
+```
+
+It writes six videos, one per camera, and two tables:
+
+```
+CAM_FRONT.mp4  CAM_FRONT_LEFT.mp4  CAM_FRONT_RIGHT.mp4
+CAM_BACK.mp4   CAM_BACK_LEFT.mp4   CAM_BACK_RIGHT.mp4
+calibration.json   each camera's intrinsic matrix, and its sensor-to-ego translation and rotation
+frames.csv         per frame: time, ego-to-global pose, velocity, acceleration, turn rate, inputs
+```
+
+Frame k of every video was taken at the same simulated instant, and row k of `frames.csv` is
+where the car was then. A frame is written only once all six cameras have delivered it. The
+conventions are nuScenes's. The ego frame has its origin in the middle of the rear axle on the
+ground, with x forward, y left and z up. A camera frame has x right, y down and z forward.
+Rotations are (w, x, y, z) quaternions. Global is the scene frame described below.
+Acceleration and turn rate are in the ego frame and averaged since the previous frame, as an
+IMU would report them. The acceleration leaves out gravity.
+
+The default is 1600 x 900 at 12 frames a second, as nuScenes, and one lap of
+`routes/east_loop.csv`: 620 m in the right-hand lane round the east end, the skid pad
+included, at up to 10 m/s and slower for the bends. A lap is 72 s of video, 858 frames per
+camera and 660 MB. The simulation takes as long as rendering takes and keeps every frame. On
+an RTX 3080 a lap takes two and a half minutes.
+
+| Option | |
+| --- | --- |
+| `--laps N`, `--duration S` | how much to record, default one lap |
+| `--route CSV` | another closed loop, as `x,y` lines in the scene frame. `tools/route.py` made the default one and shows how |
+| `--speed V` | top speed in m/s, default 10 |
+| `--rate HZ`, `--width`, `--height` | frame rate and image size |
+| `--supersample N` | N x N rays per pixel, default 2. 1 is faster and more jagged |
+| `--crf N` | x264 quality, default 18. Lower is better and bigger |
+| `--sun ELEV AZIM` | where the sun is, in degrees |
+| `--preview` | show the front camera in a window while recording |
+| `--no-trees` and the rest | as for `speedway.py` |
+
+BEVFormer reads images, not video, and nuScenes keeps its annotated keyframes at 2 Hz:
+
+```sh
+mkdir -p CAM_FRONT && ffmpeg -i CAM_FRONT.mp4 -q:v 2 -start_number 0 CAM_FRONT/%06d.jpg
+```
+
+numbers the images from 0, as the rows of `frames.csv` are. Every sixth frame is a 2 Hz
+keyframe. BEVFormer works in the lidar frame, and there is no lidar here, so use the ego frame
+in its place: `lidar2img` is then the intrinsic matrix times the inverse of the camera's
+sensor-to-ego transform. With nuScenes weights, keep in mind that nuScenes's lidar is turned
+a quarter turn from its ego frame. Training also needs 3D boxes, which this does not write. The
+manifest has the position and size of every cone, pole, tree and parked car to make them from.
 
 ## What is in the scene
 
@@ -443,7 +501,7 @@ and Windows have not been tried.
 
 ## Licence and credit
 
-`speedway.py` and `tools/` are under the BSD 3-Clause licence in [`LICENSE`](LICENSE), the same
+`speedway.py`, `record_cameras.py` and `tools/` are under the BSD 3-Clause licence in [`LICENSE`](LICENSE), the same
 terms as Chrono.
 
 The scene is built from:

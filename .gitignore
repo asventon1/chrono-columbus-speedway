@@ -4,3 +4,4 @@ scene.download
 scene.v*/
 __pycache__/
 .DS_Store
+runs/

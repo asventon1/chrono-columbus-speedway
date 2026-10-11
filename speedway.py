@@ -10,8 +10,9 @@ it starts straight away. Nothing is converted and Chrono is not modified: this n
 stock PyChrono with the vehicle and VSG modules.
 
 Controls: hold W to accelerate and S to brake, hold A or D to steer. Let go and the car coasts
-and the wheel centres, as in a driving game. --keys step gives Chrono's older behaviour, where
-each press nudges an input and it stays there.
+and the wheel centres, as in a driving game. Chrono cannot tell when a key is let go, so this
+reads the keyboard from X11 and needs an X11 desktop. --keys step gives Chrono's own behaviour,
+where each press nudges an input and it stays there, and is what you get without X11.
 
 To put the track in a simulation of your own, import this file:
 
@@ -482,16 +483,100 @@ def main():
     os._exit(0)
 
 
+class HeldKeys:
+    """Which of W, A, S and D are down, read straight from the X server.
+
+    Chrono's VSG window only tells its driver about key presses, never releases, and PyChrono
+    cannot subclass its event handler, so there is no way to learn from Chrono that a key was
+    let go. The X server knows, though: XQueryKeymap returns every key that is down. Keys only
+    count while the window titled `title` has the focus, so typing elsewhere does not drive.
+    """
+
+    KEYSYMS = {"w": 0x77, "a": 0x61, "s": 0x73, "d": 0x64}
+
+    def __init__(self, title):
+        import ctypes
+        import ctypes.util
+
+        path = ctypes.util.find_library("X11")
+        if not path or not os.environ.get("DISPLAY"):
+            raise OSError("no X11 display")
+        x = ctypes.CDLL(path)
+        x.XOpenDisplay.restype = ctypes.c_void_p
+        x.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x.XKeysymToKeycode.restype = ctypes.c_ubyte
+        x.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        x.XQueryKeymap.argtypes = [ctypes.c_void_p, ctypes.c_char * 32]
+        x.XGetInputFocus.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_int)]
+        x.XFetchName.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_char_p)]
+        x.XQueryTree.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+                                 ctypes.POINTER(ctypes.POINTER(ctypes.c_ulong)), ctypes.POINTER(ctypes.c_uint)]
+        x.XFree.argtypes = [ctypes.c_void_p]
+        self._display = x.XOpenDisplay(None)
+        if not self._display:
+            raise OSError("cannot open the X11 display")
+        self._x, self._ctypes = x, ctypes
+        self._title = title.encode()
+        self._codes = {key: x.XKeysymToKeycode(self._display, sym) for key, sym in self.KEYSYMS.items()}
+        self._keymap = (ctypes.c_char * 32)()
+        self._focus, self._ours = None, False
+
+    def _is_ours(self, window):
+        # The focus can sit on the window itself or on a child of it, so look up the tree.
+        c, x = self._ctypes, self._x
+        root, parent, children, count = c.c_ulong(), c.c_ulong(), c.POINTER(c.c_ulong)(), c.c_uint()
+        while window > 1:
+            name = c.c_char_p()
+            if x.XFetchName(self._display, window, c.byref(name)) and name.value is not None:
+                found = name.value == self._title
+                x.XFree(name)
+                if found:
+                    return True
+            if not x.XQueryTree(self._display, window, c.byref(root), c.byref(parent), c.byref(children), c.byref(count)):
+                return False
+            if children:
+                x.XFree(children)
+            if parent.value == root.value:
+                return False
+            window = parent.value
+        return False
+
+    def down(self):
+        """The set of keys among w, a, s, d that are down, empty when another window has the focus."""
+        c, x = self._ctypes, self._x
+        focus, revert = c.c_ulong(), c.c_int()
+        x.XGetInputFocus(self._display, c.byref(focus), c.byref(revert))
+        if focus.value != self._focus:
+            self._focus, self._ours = focus.value, self._is_ours(focus.value)
+        if not self._ours:
+            return set()
+        x.XQueryKeymap(self._display, self._keymap)
+        bits = self._keymap.raw
+        return {key for key, code in self._codes.items() if bits[code >> 3] >> (code & 7) & 1}
+
+
+def _ease(value, target, rise, fall, dt):
+    """Move value toward target at `rise` per second when moving away from zero, `fall` toward it."""
+    rate = rise if abs(target) > abs(value) else fall
+    if value < target:
+        return min(target, value + rate * dt)
+    return max(target, value - rate * dt)
+
+
 def run_window(system, audi, terrain, chrono, veh, step, args, boot):
+    title = "Columbus 151 Speedway"
     driver = veh.ChInteractiveDriver(audi)
-    held = args.keys == "held"
-    if held and not hasattr(veh.ChInteractiveDriver, "KeyboardMode_HELD"):
-        print("  This PyChrono has no held-key driving, so falling back to --keys step.")
-        held = False
-    if held:
-        # Pedals and wheel follow the keys that are down, and ease toward them: Chrono's driver
-        # approaches each target with a time constant of a quarter of a second.
-        driver.SetKeyboardMode(veh.ChInteractiveDriver.KeyboardMode_HELD)
+    keys = None
+    if args.keys == "held":
+        try:
+            keys = HeldKeys(title)
+        except OSError as e:
+            print(f"  Held-key driving reads the keyboard through X11, which is not available here ({e}),\n"
+                  "  so falling back to --keys step.")
+    if keys:
+        # The inputs are set here every step. Locked, Chrono's driver leaves them alone and its
+        # own key presses only move targets it no longer follows.
+        driver.SetInputMode(veh.ChInteractiveDriver.InputMode_LOCK)
     else:
         driver.SetSteeringDelta(0.04)
         driver.SetThrottleDelta(1.0 / max(1.0, args.speed_limit))
@@ -499,9 +584,7 @@ def run_window(system, audi, terrain, chrono, veh, step, args, boot):
     driver.Initialize()
 
     vis = veh.ChWheeledVehicleVisualSystemVSG()
-    if held and hasattr(vis, "SetKeyboardMode"):
-        vis.SetKeyboardMode(veh.ChInteractiveDriver.KeyboardMode_HELD)
-    vis.SetWindowTitle("Columbus 151 Speedway")
+    vis.SetWindowTitle(title)
     vis.SetWindowSize(1600, 900)
     vis.AttachVehicle(audi)
     vis.SetChaseCamera(chrono.ChVector3d(0.0, 0.0, 1.75), 7.0, 0.6)
@@ -515,7 +598,7 @@ def run_window(system, audi, terrain, chrono, veh, step, args, boot):
     vis.Initialize()
 
     print(f"\n  [{time.perf_counter() - boot:.1f} s to build the scene and open the window]")
-    if held:
+    if keys:
         print("Hold W to accelerate, S to brake, A or D to steer. Let go to coast and centre.\n")
     else:
         print("W/S step the throttle and brake, A/D step the steering.\n")
@@ -527,6 +610,8 @@ def run_window(system, audi, terrain, chrono, veh, step, args, boot):
     clock = time.perf_counter()  # the wall-clock instant that simulated time 0 is held against
     mark_wall, mark_time, mark_frames = clock, 0.0, 0
     snapshot = args.snapshot
+    steering = throttle = braking = 0.0
+    next_poll, down = 0.0, set()
 
     while vis.Run():
         now = system.GetChTime()
@@ -565,6 +650,19 @@ def run_window(system, audi, terrain, chrono, veh, step, args, boot):
                       f"{(frames - mark_frames) / (wall - mark_wall):4.1f} frames/s   {audi.GetSpeed():5.1f} m/s")
             mark_wall, mark_time, mark_frames = wall, now, frames
             next_report += 2.0
+
+        if keys:
+            if now >= next_poll:
+                down = keys.down()  # a round trip to the X server, so 100 times a second is plenty
+                next_poll = now + 0.01
+            # Full lock in half a second, and the wheel centres a little faster than that when
+            # let go. Chrono's steering is positive to the left.
+            steering = _ease(steering, ("a" in down) - ("d" in down), 2.0, 3.0, step)
+            throttle = _ease(throttle, float("w" in down), 2.0, 5.0, step)
+            braking = _ease(braking, float("s" in down), 4.0, 8.0, step)
+            driver.SetSteering(steering)
+            driver.SetThrottle(throttle)
+            driver.SetBraking(braking)
 
         inputs = driver.GetInputs()
         driver.Synchronize(now)
